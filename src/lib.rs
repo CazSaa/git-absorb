@@ -1407,6 +1407,69 @@ lines
     }
 
     #[test]
+    fn one_fixup_per_commit_groups_non_consecutive_hunks() {
+        let (ctx, file_path) = repo_utils::prepare_repo();
+
+        // The initial commit owns the whole file. Add a second commit that
+        // changes a line in the middle of it.
+        let path = ctx.join(&file_path);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let contents = contents.replace("more", "changed by middle commit");
+        std::fs::write(&path, &contents).unwrap();
+
+        {
+            let tree = repo_utils::add(&ctx.repo, &file_path);
+            let parent = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+            repo_utils::commit(&ctx.repo, "HEAD", "middle commit", &tree, &[&parent]);
+        }
+
+        // Produce three staged hunks whose destinations, in file order, are:
+        //
+        //     Initial commit -> middle commit -> Initial commit
+        //
+        // The old implementation only combined adjacent destinations, and
+        // would therefore create two fixups for Initial commit.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let contents = contents.replace(
+            "changed by middle commit",
+            "changed again after middle commit",
+        );
+        let contents = format!("inserted at top\n{contents}\ninserted at bottom\n");
+        std::fs::write(&path, contents).unwrap();
+        repo_utils::add(&ctx.repo, &file_path);
+
+        let capturing_logger = log_utils::CapturingLogger::new();
+        let config = Config {
+            one_fixup_per_commit: true,
+            ..DEFAULT_CONFIG
+        };
+        run_with_repo(&capturing_logger.logger, &config, &ctx.repo).unwrap();
+
+        let messages = extract_commit_messages(&ctx.repo);
+
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.starts_with("fixup! Initial commit."))
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.starts_with("fixup! middle commit"))
+                .count(),
+            1
+        );
+
+        let mut revwalk = ctx.repo.revwalk().unwrap();
+        revwalk.push_head().unwrap();
+        assert_eq!(revwalk.count(), 4);
+
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
     fn another_author() {
         let ctx = repo_utils::prepare_and_stage();
 
