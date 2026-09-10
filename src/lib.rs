@@ -138,8 +138,7 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         }
 
         let mut preceding_hunks_offset = 0isize;
-        let mut applied_hunks_offset = 0isize;
-        'hunk: for index_hunk in &index_patch.hunks {
+        'hunk: for (hunk_order, index_hunk) in index_patch.hunks.iter().enumerate() {
             debug!(logger, "next hunk";
                    "header" => index_hunk.header(),
                    "path" => String::from_utf8_lossy(old_path).into_owned(),
@@ -153,13 +152,6 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             let isolated_hunk = index_hunk
                 .clone()
                 .shift_added_block(-preceding_hunks_offset);
-
-            // 2) When applied on top of the previously committed hunks. This requires shifting
-            // both the "added" and the "removed" sides of the previously isolated hunk *down*
-            // by the offset of the committed hunks:
-            let hunk_to_apply = isolated_hunk
-                .clone()
-                .shift_both_blocks(applied_hunks_offset);
 
             // The offset is the number of lines added minus the number of lines removed by a hunk:
             let hunk_offset = index_hunk.changed_offset();
@@ -186,9 +178,8 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             // |----------------|-----------|------------------|
 
             debug!(logger, "";
-                "to apply" => hunk_to_apply.header(),
                 "to commute" => isolated_hunk.header(),
-                "preceding hunks" => format!("{}/{}", applied_hunks_offset, preceding_hunks_offset),
+                "preceding hunks" => preceding_hunks_offset,
             );
 
             preceding_hunks_offset += hunk_offset;
@@ -196,7 +187,7 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             // find the newest commit that the hunk cannot commute with
             let mut dest_commit = None;
             let mut commuted_old_path = old_path;
-            let mut commuted_index_hunk = isolated_hunk;
+            let mut commuted_index_hunk = isolated_hunk.clone();
 
             'commit: for (commit, diff) in &stack {
                 let c_logger = logger.new(o!(
@@ -267,14 +258,31 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             };
 
             let hunk_with_commit = HunkWithCommit {
-                hunk_to_apply,
+                isolated_hunk,
                 dest_commit,
                 index_patch,
+                hunk_order,
             };
             hunks_with_commit.push(hunk_with_commit);
-
-            applied_hunks_offset += hunk_offset;
         }
+    }
+
+    // `--one-fixup-per-commit` means one fixup for the destination commit as a
+    // whole, not merely one fixup for each consecutive run of hunks targeting
+    // that commit.
+    //
+    // Stable sorting keeps hunks for a destination in their original order.
+    // Destinations themselves remain ordered by their first occurrence.
+    if config.one_fixup_per_commit {
+        let mut target_order = std::collections::HashMap::new();
+        for hunk in &hunks_with_commit {
+            let next_order = target_order.len();
+            target_order
+                .entry(hunk.dest_commit.id())
+                .or_insert(next_order);
+        }
+
+        hunks_with_commit.sort_by_key(|hunk| target_order[&hunk.dest_commit.id()]);
     }
 
     let target_always_sha: bool = config::fixup_target_always_sha(repo);
@@ -290,16 +298,38 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
     // the `.zip` here will gives us something similar to `.windows`, but with
     // an extra iteration for the last element (otherwise we would have to
     // special case the last element and commit it separately)
+    //
+    // `isolated_hunk` uses coordinates relative to HEAD without any other
+    // staged hunks applied. Since --one-fixup-per-commit can reorder hunks, we
+    // calculate the offset from earlier hunks in the same file that have
+    // actually been applied already.
+    let mut applied_hunks_by_path: std::collections::HashMap<Vec<u8>, Vec<(usize, isize)>> =
+        std::collections::HashMap::new();
+
     for (current, next) in hunks_with_commit
         .iter()
         .zip(hunks_with_commit.iter().skip(1).map(Some).chain([None]))
     {
-        let new_head_tree = apply_hunk_to_tree(
-            repo,
-            &head_tree,
-            &current.hunk_to_apply,
-            &current.index_patch.old_path,
-        )?;
+        let old_path = current.index_patch.old_path.as_slice();
+        let applied_hunks_offset: isize = applied_hunks_by_path
+            .get(old_path)
+            .into_iter()
+            .flatten()
+            .filter(|(order, _)| *order < current.hunk_order)
+            .map(|(_, offset)| *offset)
+            .sum();
+
+        let hunk_to_apply = current
+            .isolated_hunk
+            .clone()
+            .shift_both_blocks(applied_hunks_offset);
+
+        let new_head_tree = apply_hunk_to_tree(repo, &head_tree, &hunk_to_apply, old_path)?;
+
+        applied_hunks_by_path
+            .entry(old_path.to_vec())
+            .or_default()
+            .push((current.hunk_order, current.isolated_hunk.changed_offset()));
 
         // whether there are no more hunks to apply to `dest_commit`
         let commit_fixup = next.map_or(true, |next| {
@@ -492,9 +522,10 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
 }
 
 struct HunkWithCommit<'c, 'r, 'p> {
-    hunk_to_apply: owned::Hunk,
+    isolated_hunk: owned::Hunk,
     dest_commit: &'c git2::Commit<'r>,
     index_patch: &'p owned::Patch,
+    hunk_order: usize,
 }
 
 fn apply_hunk_to_tree<'repo>(
